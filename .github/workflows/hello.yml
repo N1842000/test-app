@@ -1,28 +1,52 @@
-# ```yaml
-# name: My First Action
-
-# on:
-#   push:
-
-# jobs:
-#   test:
-#     runs-on: ubuntu-latest
-
-#     steps:
-#       - run: echo "Hello GitHub Actions"
-# ```
-
-name: Hello
+name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build:
+  test-and-build:
+    name: Test and Build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CI: true
+
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [18.x, 20.x]
 
     steps:
-      - uses: actions/checkout@v3
-      - name: Say Hello
-        run: echo "Hello, world!"
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test -- --watch=false
+
+      - name: Build production bundle
+        run: npm run build
+
+      - name: Upload production build artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.node-version }}
+          path: build
+          retention-days: 7
