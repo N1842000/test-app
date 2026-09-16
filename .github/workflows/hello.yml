@@ -11,17 +11,51 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Least privilege: nothing here needs write access to the repo.
+permissions:
+  contents: read
+
+env:
+  CI: true
+
 jobs:
+  # ---------------------------------------------------------------------------
+  # Task 1: static analysis. Independent of the others, so it runs immediately
+  # and reports lint errors without waiting on the test matrix.
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        run: npm run lint
+
+  # ---------------------------------------------------------------------------
+  # Task 2: unit tests. Runs in parallel with `lint` across both supported
+  # Node versions.
+  # ---------------------------------------------------------------------------
   test:
     name: Test (Node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    env:
-      CI: true
 
     strategy:
-      # Stop the remaining matrix legs as soon as one fails.
-      fail-fast: true
+      # Let every leg finish so one bad Node version doesn't mask the other.
+      fail-fast: false
       matrix:
         node-version: [18.x, 20.x]
 
@@ -38,20 +72,30 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Run tests
-        run: npm test -- --watch=false
+      - name: Run tests with coverage
+        run: npm test -- --watch=false --coverage
 
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.node-version }}
+          path: coverage
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # Task 3: production build. Gated on lint + tests so a broken commit never
+  # produces a publishable artifact.
+  # ---------------------------------------------------------------------------
   build:
     name: Build (Node ${{ matrix.node-version }})
-    # Skipped entirely unless every leg of `test` succeeded.
-    needs: test
+    needs: [lint, test]
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    env:
-      CI: true
 
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
         node-version: [18.x, 20.x]
 
@@ -78,3 +122,26 @@ jobs:
           name: build-${{ matrix.node-version }}
           path: build
           retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Single required check for branch protection: green only when every task
+  # above succeeded. `always()` makes it run even when a dependency fails, so
+  # the gate reports red instead of being skipped.
+  # ---------------------------------------------------------------------------
+  ci:
+    name: CI
+    if: always()
+    needs: [lint, test, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Verify all jobs succeeded
+        run: |
+          echo "lint:  ${{ needs.lint.result }}"
+          echo "test:  ${{ needs.test.result }}"
+          echo "build: ${{ needs.build.result }}"
+          if [ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" = "true" ]; then
+            echo "::error::One or more CI jobs did not succeed."
+            exit 1
+          fi
